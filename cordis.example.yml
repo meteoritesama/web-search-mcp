@@ -1,0 +1,16 @@
+# ===== DeepSeek Harness 接入配置(已实际部署到 ~/.dsh/profiles/web/cordis.patch.yml)=====
+# 说明:
+# - command 用系统 Python 的绝对路径(已装 crawl4ai)
+# - 所有可变配置(模型名/端点/默认参数)集中在项目目录的 config.py,改那里即可
+# - toolCallTimeoutMs 调大,因为抓取 + 图片描述/LLM 提取较慢
+# - 如需按环境覆盖(如双 LM Studio 实例),可在此处加 env: 段(会覆盖 config.py)
+
+- id: mcp-websearch
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: websearch
+    transport: stdio
+    command: 'C:/DevelopmentSoftware/Python/python.exe'
+    args: ['C:/Users/LiangYuelin/Desktop/workspace/web-search-mcp/server.py']
+    cwd: 'C:/Users/LiangYuelin/Desktop/workspace/web-search-mcp'
+    toolCallTimeoutMs: 300000
