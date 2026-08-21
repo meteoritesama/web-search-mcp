@@ -51,24 +51,48 @@ CONFIG = {
     # 搜索默认参数
     # ============================================================
     "default_engine": "baidu",                          # 单引擎搜索默认引擎
-    "search_max_results": 10,                           # 单引擎默认条数
+    "search_max_results": 5,                            # 单引擎默认条数(第四轮:10→5,省 token)
     "multi_engines": ["baidu", "bing", "360", "sogou"], # 综合搜索默认引擎
-    "multi_max_results": 5,                             # 综合搜索每引擎条数
+    "multi_max_results": 3,                             # 综合搜索每引擎条数(第四轮:5→3,省 token)
+
+    # ============================================================
+    # 搜索相关度与容错(第二轮优化:提高命中率)
+    # 借鉴 SearXNG 元搜索容错 + Tavily 相关性过滤
+    # ============================================================
+    # 相关性过滤:给结果按查询词打分重排,过滤低分项(结果带 relevance 字段)
+    "relevance_filter": _env("RELEVANCE_FILTER", "true").lower() in ("1", "true", "yes", "on"),
+    "relevance_min_score": float(_env("RELEVANCE_MIN_SCORE", "0.05")),  # 绝对下限
+    "relevance_relative": float(_env("RELEVANCE_RELATIVE", "0.35")),    # 相对下限(× 最高分)
+    "relevance_keep_min": int(_env("RELEVANCE_KEEP_MIN", "2")),         # 过滤后少于此数触发回退
+    # 第三轮:引号短语门控——查询带 "..." 短语而结果完全没有 → 得分乘以此系数
+    "relevance_phrase_gate": float(_env("RELEVANCE_PHRASE_GATE", "0.35")),
+    # 第三轮:域名与查询特征词互含(疑似官网)→ 得分加成,封顶 1.0
+    "relevance_domain_bonus": float(_env("RELEVANCE_DOMAIN_BONUS", "0.2")),
+    # 引擎自动回退:引擎报错或过滤后结果太少时,按 FALLBACK_CHAIN 换引擎重试
+    "engine_fallback": _env("ENGINE_FALLBACK", "true").lower() in ("1", "true", "yes", "on"),
 
     # ============================================================
     # 抓取默认参数(scrape_url / search_and_extract)
     # ============================================================
-    "scrape_max_chars": 20000,         # markdown 上限,超出截断(控制上下文)
+    "scrape_max_chars": 15000,         # markdown 上限,超出智能截断(第四轮:30000→15000,省 token)
     "scrape_describe_images": False,   # 是否默认用视觉模型描述图片(较慢)
     "scrape_max_images": 5,            # 最多描述多少张图片
 
     # ============================================================
     # 三阶段提取默认参数(llm_extract / search_and_extract 的 use_llm_extract)
     # ============================================================
-    "extract_max_chars": 20000,        # 阶段1 规则过滤后正文上限
+    "extract_max_chars": 15000,        # 阶段1 规则过滤后正文上限(第四轮:30000→15000,省 token)
     "extract_chunk_chars": 4000,       # 阶段2 分块大小(喂给小模型每块字符数)
     # search_and_extract 是否默认启用三阶段 LLM 提取(出综合总结)
     "search_extract_use_llm": False,
+
+    # ============================================================
+    # 解析质量与上下文压缩(第二轮优化)
+    # ============================================================
+    # trafilatura:Common Crawl 级正文抽取(需 pip install trafilatura,未装自动跳过)
+    "use_trafilatura": _env("USE_TRAFILATURA", "true").lower() in ("1", "true", "yes", "on"),
+    # 紧凑 markdown:去掉图片引用、链接只留文字不留 URL(links 字段仍有完整链接)
+    "compact_markdown": _env("COMPACT_MARKDOWN", "true").lower() in ("1", "true", "yes", "on"),
 
     # ============================================================
     # 性能优化(路线 A:F1 阶段批处理 / F2 并行抓取 / F3 磁盘缓存 / F5 图片降采样)

@@ -151,6 +151,59 @@ def _clean_markdown(md: str) -> str:
     return "\n".join(out).strip()
 
 
+# ---- 第二轮优化:上下文压缩(借鉴 Jina Reader 的紧凑输出理念) ----
+
+_MD_IMG = re.compile(r'!\[[^\]]*\]\([^)]*\)')          # 图片引用 ![alt](url)
+_MD_LINK = re.compile(r'\[([^\]]*)\]\([^)]*\)')        # 链接 [text](url)
+
+
+def _compact_markdown(md: str) -> str:
+    """压缩上下文:删除图片引用、链接只保留文字(URL 在 links 字段里仍有完整结构)。
+
+    链接密集的页面(维基/百科/导航页)可省 30~60% 字符。
+    """
+    if not md:
+        return ""
+    md = _MD_IMG.sub('', md)
+    md = _MD_LINK.sub(lambda m: m.group(1), md)
+    return md
+
+
+def _smart_truncate(md: str, max_chars: int) -> tuple[str, bool]:
+    """智能截断:优先在段落/行边界切断,而不是切在句子中间。"""
+    if max_chars <= 0 or len(md) <= max_chars:
+        return md, False
+    lo = int(max_chars * 0.7)
+    cut = md.rfind("\n\n", lo, max_chars)
+    if cut == -1:
+        cut = md.rfind("\n", lo, max_chars)
+    if cut == -1:
+        cut = max_chars
+    return md[:cut].rstrip() + "\n\n…[正文过长,已截断]", True
+
+
+def _trafilatura_md(html: str) -> str:
+    """用 trafilatura 抽正文(Common Crawl 级质量,新闻/文章页尤其好)。
+
+    未安装或失败时返回 "",由调用方回退到 Crawl4AI 的过滤结果。
+    """
+    if not html or not CONFIG.get("use_trafilatura", True):
+        return ""
+    try:
+        import trafilatura
+        out = trafilatura.extract(
+            html,
+            output_format="markdown",
+            include_links=False,
+            include_images=False,
+            include_tables=True,
+            with_metadata=False,
+        )
+        return (out or "").strip()
+    except Exception:
+        return ""
+
+
 # ============================================================
 # 工具定义(JSON Schema)
 # ============================================================
@@ -159,9 +212,10 @@ TOOLS = [
     {
         "name": "search_web",
         "description": (
-            "搜索网页(直接抓取搜索引擎结果页,零 API、零密钥)。"
-            "engine 可选: baidu(默认,百度) / bing(必应国内版,最稳定) / 360 / sogou。"
-            "返回标题、URL、摘要片段。"
+            "搜索网页(直接抓取引擎页,零 API)。"
+            "engine: baidu(中文推荐) / bing / 360 / sogou。"
+            "结果按相关度重排过滤(短语感知+域名加成,带 relevance);"
+            "引擎失败自动回退(fallback_from 标注)。返回标题、URL、摘要。"
         ),
         "inputSchema": {
             "type": "object",
@@ -169,7 +223,7 @@ TOOLS = [
                 "query": {"type": "string", "description": "搜索关键词"},
                 "engine": {
                     "type": "string",
-                    "description": "搜索引擎: baidu / bing / 360 / sogou",
+                    "description": "baidu(中文推荐)/bing/360/sogou",
                     "enum": ["baidu", "bing", "360", "sogou"],
                     "default": CONFIG["default_engine"],
                 },
@@ -185,8 +239,10 @@ TOOLS = [
     {
         "name": "search_multi",
         "description": (
-            "多搜索引擎综合搜索:并发查询百度/必应/360/搜狗,按 URL 去重合并,"
-            "覆盖更全、结果更综合。每条结果带 engine 字段标明来源;单引擎失败不影响整体。"
+            "多引擎综合搜索:并发查询百度/必应/360/搜狗,URL+标题两级去重合并。"
+            "每条带 engine/engine_count/relevance;单引擎失败不影响整体。"
+            "按「命中引擎数+相关度」加权排序,自动压住单字词劫持与同名异实体混淆。"
+            "**中文复杂查询、含引号短语强烈推荐**。"
         ),
         "inputSchema": {
             "type": "object",
@@ -195,11 +251,11 @@ TOOLS = [
                 "engines": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["baidu", "bing", "360", "sogou"]},
-                    "description": "参与综合的搜索引擎列表,默认全部(baidu/bing/360/sogou)",
+                    "description": "参与引擎,默认全部",
                 },
                 "max_results": {
                     "type": "number",
-                    "description": "每个引擎返回的结果条数(1-20)",
+                    "description": "每引擎条数(1-20)",
                     "default": CONFIG["multi_max_results"],
                 },
             },
@@ -209,9 +265,9 @@ TOOLS = [
     {
         "name": "scrape_url",
         "description": (
-            "用 Crawl4AI 解析整个网页(结构 + 文本 + 图片),"
-            "并可用本地 LM Studio 视觉模型把每张图片转成中文文字描述。"
-            "返回 markdown(净化全文)、links(链接)、images(图片URL+alt)、image_descriptions(图片描述)。"
+            "抓取网页正文(trafilatura 高质量抽取+紧凑 markdown,默认去图片引用/链接只留文字)。"
+            "返回 markdown、links、images;可选 describe_images(视觉模型描述,较慢)。"
+            "markdown_mode 标明抽取方式:trafilatura/filtered/full。"
         ),
         "inputSchema": {
             "type": "object",
@@ -220,23 +276,23 @@ TOOLS = [
                 "include_markdown": {"type": "boolean", "default": True},
                 "full_markdown": {
                     "type": "boolean",
-                    "description": "true=完整 markdown(含导航/广告);false=过滤后正文(默认,推荐)",
+                    "description": "true=完整(含导航/广告);false=过滤后正文(默认)",
                     "default": False,
                 },
                 "max_chars": {
                     "type": "number",
-                    "description": "markdown 最大字符数(超出截断,控制上下文占用)",
+                    "description": "markdown 最大字符数(超出截断)",
                     "default": CONFIG["scrape_max_chars"],
                 },
                 "include_links": {"type": "boolean", "default": True},
                 "include_images": {"type": "boolean", "default": True},
                 "describe_images": {
                     "type": "boolean",
-                    "description": "是否用本地视觉模型描述图片(需设置 VISION_MODEL,默认关,较慢)",
+                    "description": "视觉模型描述图片(较慢)",
                     "default": False,
                 },
-                "max_images": {"type": "number", "description": "最多描述多少张图片", "default": CONFIG["scrape_max_images"]},
-                "image_prompt": {"type": "string", "description": "图片描述提示词(默认中文简洁描述)", "default": ""},
+                "max_images": {"type": "number", "description": "最多描述几张图片", "default": CONFIG["scrape_max_images"]},
+                "image_prompt": {"type": "string", "description": "图片描述提示词", "default": ""},
             },
             "required": ["url"],
         },
@@ -244,8 +300,8 @@ TOOLS = [
     {
         "name": "search_and_extract",
         "description": (
-            "搜索并自动抓取、解析前 N 条结果,一步到位。"
-            "use_llm_extract=true 时走三阶段 LLM 提取,并汇总成一份综合总结(需加载 SMALL/LARGE_MODEL)。"
+            "搜索并自动抓取前 N 条结果,一步到位。"
+            "use_llm_extract=true 时走三阶段 LLM 提取(小模型逐块提取+大模型汇总),出综合总结。"
         ),
         "inputSchema": {
             "type": "object",
@@ -255,8 +311,9 @@ TOOLS = [
                     "type": "string",
                     "enum": ["baidu", "bing", "360", "sogou"],
                     "default": CONFIG["default_engine"],
+                    "description": "baidu(中文推荐)/bing/360/sogou",
                 },
-                "max_results": {"type": "number", "description": "抓取前几条结果", "default": 3},
+                "max_results": {"type": "number", "description": "抓取前几条结果", "default": 2},
                 "use_llm_extract": {
                     "type": "boolean",
                     "description": "true=三阶段 LLM 提取并出综合总结;false=返回原始 markdown",
@@ -271,9 +328,8 @@ TOOLS = [
     {
         "name": "llm_extract",
         "description": (
-            "三阶段智能提取:①规则过滤抓取的网页正文 → ②小模型逐块快速提取有用信息 → "
-            "③大模型汇总成连贯总结。彻底去除广告/导航噪声,输出高价值摘要。"
-            "需在 LM Studio 加载 SMALL_MODEL(快速提取)与 LARGE_MODEL(汇总)。"
+            "三阶段智能提取:规则过滤→小模型逐块提取→大模型汇总,去广告/导航噪声,出高价值摘要。"
+            "需加载 SMALL_MODEL 与 LARGE_MODEL。"
         ),
         "inputSchema": {
             "type": "object",
@@ -425,18 +481,34 @@ async def _do_scrape(
     if include_markdown:
         raw = getattr(result, "markdown", "") or ""
         fit = getattr(result, "fit_markdown", None) or ""
+        # 第二轮优化:引入 trafilatura(Common Crawl 级正文抽取)作为高质量候选。
+        # - 无查询词:优先 trafilatura(去模板噪声最好),回退 Crawl4AI 过滤版;
+        # - 有查询词:优先 BM25 查询过滤版(更聚焦),过度剪枝时回退 trafilatura。
+        tf = "" if full_markdown else _trafilatura_md(getattr(result, "html", "") or "")
         if full_markdown:
             md, mode = raw, "full"
-        elif fit and len(fit) >= 200:
-            # 过滤版足够长才采用;过短(过度剪枝)则回退原始
-            md, mode = fit, "filtered"
+        elif query:
+            if fit and len(fit) >= 200:
+                md, mode = fit, "filtered"
+            elif tf and len(tf) >= 200:
+                md, mode = tf, "trafilatura"
+            else:
+                md, mode = raw, "full-fallback"
         else:
-            md, mode = raw, "full-fallback"
+            if tf and len(tf) >= 200:
+                md, mode = tf, "trafilatura"
+            elif fit and len(fit) >= 200:
+                md, mode = fit, "filtered"
+            else:
+                md, mode = raw, "full-fallback"
         md = _clean_markdown(md)
-        data["markdown"] = md[:max_chars]
-        data["markdown_mode"] = mode
+        if CONFIG["compact_markdown"]:  # 第二轮:紧凑化,链接只留文字、去图片引用
+            md = _compact_markdown(md)
         data["markdown_chars"] = len(md)
-        data["markdown_truncated"] = len(md) > max_chars
+        md, truncated = _smart_truncate(md, max_chars)  # 第二轮:段落边界智能截断
+        data["markdown"] = md
+        data["markdown_mode"] = mode
+        data["markdown_truncated"] = truncated
 
     if include_links:
         links = getattr(result, "links", None)

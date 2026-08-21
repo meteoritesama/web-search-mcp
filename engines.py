@@ -8,11 +8,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
 from urllib.parse import urljoin
 
 import httpx
 from bs4 import BeautifulSoup
+
+from config import CONFIG
+from rank import rerank, score_result, parse_query, domain_token_match
 
 HEADERS = {
     "User-Agent": (
@@ -75,7 +79,10 @@ async def search_baidu(query: str, max_results: int = 10) -> list[dict]:
 
 
 async def search_bing(query: str, max_results: int = 10) -> list[dict]:
-    # cn.bing.com 为中国大陆可直接访问的必应,结构稳定、反爬较弱
+    # cn.bing.com 为中国大陆可直接访问的必应,结构稳定、反爬较弱。
+    # 已知限制:对中文多词查询排序极度偏向单字词,例如 "东铁线 旺角东 红磡"
+    # 会被"东"字字典页劫持。+运算符/AND/引号/去空格均无法修复。
+    # 复杂中文查询建议用 baidu / 360,或使用 search_multi 多引擎综合。
     url = "https://cn.bing.com/search"
     params = {"q": query, "count": max_results, "setlang": "zh-hans", "mkt": "zh-CN"}
     async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True, trust_env=False) as c:
@@ -145,14 +152,81 @@ ENGINES = {
     "sogou": search_sogou,
 }
 
+# 引擎自动回退链(借鉴 SearXNG 的 engine fallback):主引擎失败或结果相关性过低时按序尝试。
+# 主要针对 Bing CN 对中文多词查询的「单字词劫持」。
+FALLBACK_CHAIN = {
+    "bing": ["baidu", "360"],
+    "sogou": ["baidu", "360"],
+    "baidu": ["360", "bing"],
+    "360": ["baidu", "bing"],
+}
+
+
+async def _engine_once(engine: str, query: str, cap: int):
+    """调一个引擎并做相关性重排/过滤。返回 (kept, dropped, raw_count)。"""
+    results = await ENGINES[engine](query, max_results=cap)
+    raw_count = len(results)
+    if CONFIG.get("relevance_filter", True):
+        kept, dropped = rerank(
+            query, results,
+            min_score=float(CONFIG.get("relevance_min_score", 0.05)),
+            relative=float(CONFIG.get("relevance_relative", 0.35)),
+            phrase_gate=float(CONFIG.get("relevance_phrase_gate", 0.35)),
+            domain_bonus=float(CONFIG.get("relevance_domain_bonus", 0.2)),
+        )
+    else:
+        kept, dropped = results, 0
+    return kept, dropped, raw_count
+
 
 async def search(query: str, engine: str = "baidu", max_results: int = 10) -> dict:
+    """单引擎搜索 + 相关性重排过滤 + 引擎自动回退。
+
+    - 相关性过滤(relevance_filter):按查询词给结果打分重排,过滤低分项;
+    - 自动回退(engine_fallback):当引擎抛错(如反爬)或过滤后结果太少时,
+      按 FALLBACK_CHAIN 依次尝试备选引擎,取「过滤后结果最多」的一次返回。
+    返回里 engine 为实际产出结果的引擎;若发生回退,附 fallback_from 标注原始引擎。
+    """
     engine = (engine or "baidu").lower()
-    fn = ENGINES.get(engine)
-    if fn is None:
+    if engine not in ENGINES:
         raise ValueError(f"不支持的搜索引擎: {engine},可选: {', '.join(ENGINES)}")
-    results = await fn(query, max_results=max(1, min(max_results, 30)))
-    return {"query": query, "engine": engine, "count": len(results), "results": results}
+    cap = max(1, min(max_results, 30))
+
+    chain = [engine]
+    if CONFIG.get("engine_fallback", True):
+        chain += [e for e in FALLBACK_CHAIN.get(engine, []) if e not in chain]
+
+    keep_min = int(CONFIG.get("relevance_keep_min", 2))
+    best = None          # (kept, dropped, used_engine)
+    errors: dict = {}
+    for eng in chain:
+        try:
+            kept, dropped, raw_count = await _engine_once(eng, query, cap)
+        except Exception as ex:  # 引擎失败:记录并继续回退
+            errors[eng] = f"{type(ex).__name__}: {ex}"
+            continue
+        if best is None or len(kept) > len(best[0]):
+            best = (kept, dropped, eng)
+        if len(kept) >= keep_min:   # 已拿到足够相关结果,停止回退
+            break
+
+    if best is None:
+        raise RuntimeError(f"所有搜索引擎均失败: {errors}")
+
+    kept, dropped, used = best
+    out = {
+        "query": query,
+        "engine": used,
+        "count": len(kept),
+        "results": kept,
+    }
+    if used != engine:
+        out["fallback_from"] = engine
+    if dropped:
+        out["filtered_out"] = dropped
+    if errors:
+        out["engine_errors"] = errors
+    return out
 
 
 def _norm_url(url: str) -> str:
@@ -169,6 +243,67 @@ def _norm_url(url: str) -> str:
     if u.startswith("www."):
         u = u[4:]
     return u.split("#", 1)[0]
+
+
+_TITLE_NORM_RE = re.compile(r"[^0-9a-z\u4e00-\u9fff]+")
+
+
+def _norm_title(title: str) -> str:
+    """标题归一化(跨引擎近似去重键):小写,仅保留中文/字母/数字。"""
+    return _TITLE_NORM_RE.sub("", (title or "").lower())
+
+
+def _merge_by_title(merged: list[dict], query: str = "") -> list[dict]:
+    """二次合并:归一化标题相同的条目合并(不同引擎的跳转链接常指向同一页面)。
+
+    - engines 取并集,engine_count 相应重算(跨引擎共识越强排越前);
+    - URL 保留更可能是直链的一条:非跳转链接(不含 /link?)优先,
+      其次域名与查询词互含者(疑似官网)优先;
+    - snippet 保留最长的(信息量最大),title 随之;
+    - 落选 URL 记入 duplicates,信息不丢。
+    空标题不参与合并。
+    """
+    phrases, terms = parse_query(query)
+    dom_terms = terms + phrases
+
+    def _is_jump(u: str) -> bool:
+        return "/link?" in (u or "")
+
+    def _url_better(new: str, base: str) -> bool:
+        nj, bj = _is_jump(new), _is_jump(base)
+        if nj != bj:
+            return bj and not nj
+        return domain_token_match(new, dom_terms) and not domain_token_match(base, dom_terms)
+
+    by_title: dict[str, dict] = {}
+    order: list[str] = []
+    for idx, m in enumerate(merged):
+        key = _norm_title(m.get("title", "")) or f"__notitle{idx}"
+        if key not in by_title:
+            order.append(key)
+            by_title[key] = dict(m)
+            continue
+        base = by_title[key]
+        for e in m.get("engines", []):
+            if e not in base["engines"]:
+                base["engines"].append(e)
+        if len(m.get("snippet", "")) > len(base.get("snippet", "")):
+            base["snippet"] = m["snippet"]
+            if m.get("title"):
+                base["title"] = m["title"]
+        if _url_better(m.get("url", ""), base.get("url", "")):
+            base.setdefault("duplicates", []).append(base["url"])
+            base["url"] = m["url"]
+        else:
+            base.setdefault("duplicates", []).append(m.get("url", ""))
+        base["_rank"] = min(base.get("_rank", idx), m.get("_rank", idx))
+
+    out = []
+    for key in order:
+        m = by_title[key]
+        m["engine_count"] = len(m["engines"])
+        out.append(m)
+    return out
 
 
 async def search_multi(query: str, engines: Optional[list[str]] = None, max_results: int = 5) -> dict:
@@ -230,8 +365,24 @@ async def search_multi(query: str, engines: Optional[list[str]] = None, max_resu
             "_rank": idx,
         })
 
-    # 加权排序:命中引擎越多越靠前;同分按首次出现顺序
-    merged.sort(key=lambda x: (-x["engine_count"], x["_rank"]))
+    # 二次合并:不同引擎跳转链接指向同一页面时,按归一化标题去重(取并集、留直链)
+    merged = _merge_by_title(merged, query)
+
+    # 加权排序:命中引擎越多越靠前;同引擎数按「与查询的相关度」降序,再按首次出现顺序。
+    # 相关度排序能压住 Bing 单字词劫持带来的无关项;传 URL 以便域名权威加成。
+    # 注意:search_multi 定位为综合广搜,只重排、不过滤——保留更多线索(含近义/期刊页),
+    # 靠相关度把它们压到尾部即可,避免误删用户可能想要的实体。
+    if CONFIG.get("relevance_filter", True):
+        for m in merged:
+            m["relevance"] = round(
+                score_result(
+                    query, m["title"], m["snippet"], m.get("url", ""),
+                    phrase_gate=float(CONFIG.get("relevance_phrase_gate", 0.35)),
+                    domain_bonus=float(CONFIG.get("relevance_domain_bonus", 0.2)),
+                ), 3)
+        merged.sort(key=lambda x: (-x["engine_count"], -x["relevance"], x["_rank"]))
+    else:
+        merged.sort(key=lambda x: (-x["engine_count"], x["_rank"]))
     for m in merged:
         m.pop("_rank", None)
 

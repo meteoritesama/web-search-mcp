@@ -33,9 +33,12 @@
 | LM Studio 连接 | `llm_base_url` / `llm_api_key` | 端点与密钥 |
 | 视觉模型 | `vision_model` | 图片描述用的多模态模型 |
 | LLM 提取 | `small_model` / `large_model` | 小模型快速提取 + 大模型汇总 |
-| 搜索默认 | `default_engine` / `multi_engines` / `search_max_results` 等 | 引擎与条数 |
-| 抓取默认 | `scrape_max_chars` / `scrape_describe_images` 等 | 正文上限、是否描述图片 |
-| 提取默认 | `extract_max_chars` / `extract_chunk_chars` | 三阶段提取参数 |
+| 搜索默认 | `default_engine` / `multi_engines` / `search_max_results`(5) / `multi_max_results`(3) | 引擎与条数(第四轮下调省 token) |
+| 搜索相关度(第二轮) | `relevance_filter` / `relevance_min_score` / `engine_fallback` 等 | 结果按相关度重排过滤 + 引擎自动回退 |
+| 搜索相关度(第三轮) | `relevance_phrase_gate` / `relevance_domain_bonus` | 引号短语门控 + 域名权威加成 |
+| 抓取默认 | `scrape_max_chars`(15000) / `scrape_describe_images` 等 | 正文上限(第四轮 30000→15000)、是否描述图片 |
+| 提取默认 | `extract_max_chars`(15000) / `extract_chunk_chars` | 三阶段提取参数(第四轮 30000→15000) |
+| 解析质量(第二轮) | `use_trafilatura` / `compact_markdown` | trafilatura 正文抽取、紧凑 markdown(省上下文) |
 | 性能优化(路线 A) | `cache_enabled` / `cache_ttl_hours` / `scrape_concurrency` / `vision_max_side` | 磁盘缓存、并行抓取限流、视觉图片降采样 |
 | Crawl4AI | `crawl4ai_base_dir` | 数据目录(留空=项目内) |
 
@@ -131,18 +134,20 @@ playwright install chromium
 
 模型侧会自然调用工具,例如:
 
-- "搜索一下『大模型 RAG 最新进展』" → `search_web(query="大模型 RAG 最新进展", engine="bing")`
+- "搜索一下『大模型 RAG 最新进展』" → `search_web(query="大模型 RAG 最新进展", engine="baidu")`
 - "抓取并解析这个网页,并告诉我里面的图片是什么" → `scrape_url(url="https://...", describe_images=true)`
-- "帮我搜『比特币 行情』并总结前 3 篇文章" → `search_and_extract(query="比特币 行情", engine="bing", max_results=3)`
+- "帮我搜『比特币 行情』并总结前 3 篇文章" → `search_and_extract(query="比特币 行情", engine="baidu", max_results=3)`
 
 搜索引擎选择:
 
 | engine | 说明 |
 |---|---|
-| `baidu` | 默认,百度;返回的 URL 是跳转链接,`search_and_extract` 会自动还原 |
-| `bing` | 必应国内版,结果 URL 干净、反爬最弱,**最推荐用于"搜索+抓取"** |
-| `360` | 360 搜索 |
+| `baidu` | **默认,推荐中文查询**;返回 URL 是跳转链接,`search_and_extract` 会自动还原 |
+| `bing` | 必应国内版,URL 干净、反爬最弱;但**对中文多词查询容易返回无关结果**(单字词劫持),仅建议英文/简单查询或 `search_multi` 兜底 |
+| `360` | 360 搜索,中文复杂查询结果质量好 |
 | `sogou` | 搜狗(反爬较强,偶尔失败) |
+
+> 中文复杂查询(含多词组合)建议使用 `search_multi`(多引擎综合,并发百度/360/搜狗,去重合并),或 `engine="baidu"` / `"360"`。Bing 的 `+` 运算符/AND 关键词/引号均无法修复其单字词劫持问题。
 
 ---
 
@@ -166,7 +171,8 @@ playwright install chromium
 ## 文件说明
 
 - `server.py` —— MCP 服务入口(手写 MCP stdio,零 mcp/pydantic 依赖)
-- `engines.py` —— 搜索引擎抓取模块(百度/必应/360/搜狗)
+- `engines.py` —— 搜索引擎抓取模块(百度/必应/360/搜狗)+ 相关度重排 + 引擎自动回退
+- `rank.py` —— 搜索结果相关度评分/重排/过滤(零依赖,修 Bing 单字词劫持)
 - `vision.py` —— LM Studio 视觉模型图片描述
 - `cache.py` —— 磁盘缓存模块(抓取结果 / 图片描述复用,纯标准库)
 - `config.py` —— 集中配置(所有可变项)
@@ -188,6 +194,57 @@ playwright install chromium
 
 > F5 需要可选依赖 `Pillow`(已在 requirements.txt);未安装时自动跳过降采样,其余功能不受影响。
 > 缓存目录默认在项目内 `.cache/`;设 `CACHE_ENABLED=false` 可整体关闭。
+
+## 第二轮优化(命中率 + 解析质量 + 省上下文 · 已落地)
+
+借鉴 SearXNG(元搜索容错)、Tavily(相关性过滤)、trafilatura(Common Crawl 级正文抽取)、Jina Reader(紧凑输出)的成熟做法:
+
+| 项 | 说明 | 实测效果 |
+|---|---|---|
+| **相关度评分/重排** | `rank.py` 按查询词给结果打分(整词命中 title+2/snippet+1,bigram 部分命中给部分分),重排并过滤低分项,结果带 `relevance` 字段 | 无关字典页 0.000、强相关 0.556,区分清晰 |
+| **引擎自动回退** | `search()` 若引擎报错或过滤后结果太少,按 `FALLBACK_CHAIN` 换引擎重试,取相关结果最多的一次;`fallback_from` 标注原始引擎 | Bing 劫持查询自动回退百度,返回东铁线相关结果 |
+| **search_multi 相关度排序** | 合并结果按「命中引擎数 + 相关度」加权排序,压住单引擎无关项 | 首条即高度相关(rel≈0.48) |
+| **trafilatura 正文抽取** | 优先用 trafilatura(Common Crawl 级)抽正文,新闻/文章/百科页去模板噪声最好;未装自动回退 Crawl4AI 过滤 | 百科页正文干净,导航/页脚剔除 |
+| **紧凑 markdown** | 去图片引用、链接只留文字(URL 在 `links` 字段仍有) | 链接密集页省 **71%** 上下文 |
+| **智能截断** | 在段落/行边界截断而非切句子,附截断标记 | 截断后可读性保留 |
+| **正文上限下调** | `scrape_max_chars` / `extract_max_chars` 20000 → 15000 | 进一步控上下文 |
+
+> trafilatura 为可选依赖(已加入 requirements.txt);未安装时自动回退,不影响其余功能。
+> 相关度阈值可用 `RELEVANCE_MIN_SCORE` / `RELEVANCE_RELATIVE` / `RELEVANCE_KEEP_MIN` 调;关闭回退设 `ENGINE_FALLBACK=false`。
+
+## 第三轮优化(精确命中率 · 已落地)
+
+针对「同名异实体混淆」(如 ICHMT 既是**组织** International Centre for Heat and Mass Transfer,又是**期刊** International Communications in Heat and Mass Transfer)导致官方页被埋的问题:
+
+| 项 | 说明 | 实测效果 |
+|---|---|---|
+| **引号短语感知** | 查询里 `"..."` 短语作为**整体**精确匹配(不再拆碎),命中大幅加权;结果完全没有引号短语 → 乘以 `phrase_gate` 衰减 | ichmt.org 官网从 #13(0.177)升到 #2(0.443);期刊被门控压到 0.06 |
+| **停用词过滤** | for/and/in/the/的/了… 不参与打分,避免稀释 | 长查询区分度提升 |
+| **域名权威加成** | 域名主部与查询特征词互含(如查询含 ICHMT、域名 ichmt.org)→ 疑似官方站点加 `domain_bonus` | MNHMT-2027 会议页 0.164→0.438 |
+| **标题级去重合并** | 不同引擎的跳转链接常指向同一页面,按归一化标题二次合并(取引擎并集、留直链、留最长摘要) | 4×「Home\|ICHMT」→ 1 条 engine_count=3,直链 ichmt.org 排第一 |
+
+> 新增配置:`RELEVANCE_PHRASE_GATE`(0.35)、`RELEVANCE_DOMAIN_BONUS`(0.2),均可 `.env` 覆盖。
+> `search_multi` 只重排不过滤(综合广搜,保留近义/期刊页线索,靠相关度压到尾部);单引擎 `search_web` 仍过滤+回退。
+
+## 第四轮优化(Token 预算压缩 · 已落地)
+
+搜索类任务经常触发 token 上限被截断,根因是默认参数过大:
+
+| 项 | 旧默认 | 新默认 | 省 Token |
+|---|---|---|---|
+| **scrape_max_chars** | 30000 | **15000** | 单页减半 |
+| **extract_max_chars** | 30000 | **15000** | 单页减半 |
+| **search_max_results** | 10 | **5** | 结果数减半 |
+| **multi_max_results** | 5 | **3** | 每引擎 3 条(4 引擎共 12 条) |
+| **search_and_extract max_results** | 3 | **2** | 抓取条数减少 |
+| **工具描述压缩** | ~2500 tokens | **~1500 tokens** | 省 ~1000 tokens |
+
+**典型搜索任务 Token 消耗对比**(search_multi + scrape 2 条):
+- 旧:搜索 ~3000 + 抓取 2×30000=60000 字符 ≈ **~35000 tokens**
+- 新:搜索 ~1500 + 抓取 2×15000=30000 字符 ≈ **~18000 tokens**
+- **省 ~50%**
+
+> 若某场景需要更多结果/更长正文,可在调用时显式传 `max_results`/`max_chars` 覆盖默认值。
 
 ## 已知限制
 

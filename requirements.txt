@@ -7,3 +7,5 @@ lxml>=5.2.0
 crawl4ai>=0.5.0
 # 可选(路线 A · F5):视觉模型图片降采样,减少图片 token、提速省显存;不装自动跳过降采样
 Pillow>=10.0.0
+# 可选(第二轮优化):trafilatura 高质量正文抽取(Common Crawl 级,新闻/文章页效果显著);不装自动回退 Crawl4AI 过滤
+trafilatura>=1.12.0

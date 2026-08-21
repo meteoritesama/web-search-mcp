@@ -12,12 +12,13 @@
 |---|---|
 | `config.py` | ★ **集中配置文件**:所有可变配置(模型名/端点/默认参数)都在这里 |
 | `server.py` | MCP 服务入口(手写 MCP stdio 协议,零 mcp/pydantic 依赖) |
-| `engines.py` | 搜索引擎抓取模块(百度/必应/360/搜狗) |
+| `engines.py` | 搜索引擎抓取模块(百度/必应/360/搜狗)+ 相关度重排 + 引擎自动回退 |
+| `rank.py` | 搜索结果相关度评分/重排/过滤(第二轮优化,零依赖) |
 | `vision.py` | LM Studio 视觉模型图片描述 + LLM 文本对话 |
 | `cache.py` | 磁盘缓存模块(路线 A · F3:抓取结果 / 图片描述复用,纯标准库) |
-| `requirements.txt` | Python 依赖清单(含可选 Pillow,用于 F5 图片降采样) |
+| `requirements.txt` | Python 依赖清单(含可选 Pillow、trafilatura) |
 | `README.md` | 使用与部署文档 |
-| `OPTIMIZATION.md` | 性能优化方案(路线 A 已落地;路线 B 换模型方案待选) |
+| `OPTIMIZATION.md` | 性能优化方案(路线 A 已落地;第二轮优化已落地;路线 B 换模型方案待选) |
 | `.env.example` | 视觉模型环境变量示例 |
 | `cordis.example.yml` | DSH 接入配置示例(与实际部署一致) |
 | `.crawl4ai/` | crawl4ai 数据目录(**首次抓取时自动生成**,由 `CRAWL4_AI_BASE_DIRECTORY` 指定到项目内) |
@@ -63,7 +64,7 @@
 | 路径 | 说明 |
 |---|---|
 | `C:\DevelopmentSoftware\Python\python.exe` | Python 3.13.7(DSH 配置里 `command` 用的就是这个) |
-| `C:\DevelopmentSoftware\Python\Lib\site-packages\` | 已安装:crawl4ai 0.9.2、playwright、lxml、pydantic、httpx、beautifulsoup4 等 |
+| `C:\DevelopmentSoftware\Python\Lib\site-packages\` | 已安装:crawl4ai 0.9.2、playwright、lxml、pydantic、httpx、beautifulsoup4、Pillow 12.2、trafilatura 2.2 等 |
 
 ---
 
