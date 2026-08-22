@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 
 from config import CONFIG
 
@@ -34,14 +35,18 @@ def _path(key: str) -> str:
     return os.path.join(_CACHE_DIR, key + ".json")
 
 
-def get(kind: str, **params):
-    """读缓存:命中且未过期返回值,否则 None。"""
+def get(kind: str, ttl_sec: float | None = None, **params):
+    """读缓存:命中且未过期返回值,否则 None。
+
+    ``ttl_sec`` 允许搜索等高频、短生命周期数据使用比全局抓取缓存更短的 TTL。
+    """
     if not ENABLED:
         return None
     try:
         with open(_path(_mk_key(kind, **params)), "r", encoding="utf-8") as f:
             obj = json.load(f)
-        if time.time() - float(obj.get("t", 0)) > _TTL_SEC:
+        ttl = _TTL_SEC if ttl_sec is None else max(0.0, float(ttl_sec))
+        if ttl <= 0.0 or time.time() - float(obj.get("t", 0)) > ttl:
             return None
         return obj.get("v")
     except Exception:
@@ -55,7 +60,8 @@ def put(kind: str, value, **params) -> None:
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
         p = _path(_mk_key(kind, **params))
-        tmp = p + ".tmp"
+        # Unique temporary names prevent concurrent writers from clobbering each other.
+        tmp = p + f".{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"t": time.time(), "v": value}, f, ensure_ascii=False)
         os.replace(tmp, p)

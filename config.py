@@ -70,6 +70,12 @@ CONFIG = {
     "relevance_domain_bonus": float(_env("RELEVANCE_DOMAIN_BONUS", "0.2")),
     # 引擎自动回退:引擎报错或过滤后结果太少时,按 FALLBACK_CHAIN 换引擎重试
     "engine_fallback": _env("ENGINE_FALLBACK", "true").lower() in ("1", "true", "yes", "on"),
+    # 引擎健康保护:连续失败后本进程内暂时冷却该引擎,减少无效重试和对站点的压力。
+    "engine_breaker_enabled": _env("ENGINE_BREAKER_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
+    "engine_breaker_fail_threshold": int(_env("ENGINE_BREAKER_FAIL_THRESHOLD", "3")),
+    "engine_breaker_cooldown_sec": float(_env("ENGINE_BREAKER_COOLDOWN_SEC", "300")),
+    # 搜索结果缓存:短时复用相同查询,降低重复访问频率;0 表示禁用。
+    "search_cache_ttl_sec": float(_env("SEARCH_CACHE_TTL_SEC", "120")),
 
     # ============================================================
     # 抓取默认参数(scrape_url / search_and_extract)

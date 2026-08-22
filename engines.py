@@ -15,8 +15,16 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 
+import cache as _cache
+from breaker import EngineCircuitBreaker
 from config import CONFIG
 from rank import rerank, score_result, parse_query, domain_token_match
+
+
+BREAKER = EngineCircuitBreaker(
+    fail_threshold=CONFIG.get("engine_breaker_fail_threshold", 3),
+    cooldown_sec=CONFIG.get("engine_breaker_cooldown_sec", 300),
+)
 
 HEADERS = {
     "User-Agent": (
@@ -47,11 +55,38 @@ def _soup(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 
+def heuristic_fallback_extract(html: str, query: str, base_url: str, max_results: int) -> list[dict]:
+    """Conservative structural fallback for layout drift, not a bypass mechanism.
+
+    It only accepts visible HTTP(S) links with a plausible title and removes obvious
+    navigation/javascript links.  Returning an empty list remains valid for a genuine
+    no-result page.
+    """
+    terms = [term.lower() for term in parse_query(query)[1] if len(term) > 1]
+    candidates, seen = [], set()
+    for a in _soup(html).find_all("a", href=True):
+        title = _text(a)
+        href = urljoin(base_url, a.get("href", ""))
+        if not href.startswith(("http://", "https://")) or not 8 <= len(title) <= 160:
+            continue
+        if href in seen or (terms and not any(term in title.lower() for term in terms)):
+            continue
+        parent = a.parent
+        context = _text(parent)
+        snippet = context.replace(title, "", 1).strip()[:300] if context else ""
+        candidates.append(_result(title, href, snippet))
+        seen.add(href)
+        if len(candidates) >= max_results:
+            break
+    return candidates
+
+
 async def search_baidu(query: str, max_results: int = 10) -> list[dict]:
     url = "https://www.baidu.com/s"
     params = {"wd": query, "rn": max_results, "ie": "utf-8", "f": "8"}
     async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True, trust_env=False) as c:
         r = await c.get(url, params=params)
+        r.raise_for_status()
     html = r.text
     if any(m in html for m in _BAIDU_VERIFY_MARKERS):
         raise RuntimeError("百度触发了安全验证(反爬),请稍后重试,或改用 engine='bing' / '360'")
@@ -75,7 +110,7 @@ async def search_baidu(query: str, max_results: int = 10) -> list[dict]:
         out.append(_result(title, href, snippet))
         if len(out) >= max_results:
             break
-    return out
+    return out or heuristic_fallback_extract(html, query, "https://www.baidu.com/", max_results)
 
 
 async def search_bing(query: str, max_results: int = 10) -> list[dict]:
@@ -87,6 +122,7 @@ async def search_bing(query: str, max_results: int = 10) -> list[dict]:
     params = {"q": query, "count": max_results, "setlang": "zh-hans", "mkt": "zh-CN"}
     async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True, trust_env=False) as c:
         r = await c.get(url, params=params)
+        r.raise_for_status()
     soup = _soup(r.text)
     out: list[dict] = []
     for li in soup.select("li.b_algo"):
@@ -100,7 +136,7 @@ async def search_bing(query: str, max_results: int = 10) -> list[dict]:
         out.append(_result(title, href, snippet))
         if len(out) >= max_results:
             break
-    return out
+    return out or heuristic_fallback_extract(r.text, query, "https://cn.bing.com/", max_results)
 
 
 async def search_360(query: str, max_results: int = 10) -> list[dict]:
@@ -108,6 +144,7 @@ async def search_360(query: str, max_results: int = 10) -> list[dict]:
     params = {"q": query}
     async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True, trust_env=False) as c:
         r = await c.get(url, params=params)
+        r.raise_for_status()
     soup = _soup(r.text)
     out: list[dict] = []
     for li in soup.select("li.res-list, li[class*='res-list']"):
@@ -121,7 +158,7 @@ async def search_360(query: str, max_results: int = 10) -> list[dict]:
         out.append(_result(title, href, snippet))
         if len(out) >= max_results:
             break
-    return out
+    return out or heuristic_fallback_extract(r.text, query, "https://www.so.com/", max_results)
 
 
 async def search_sogou(query: str, max_results: int = 10) -> list[dict]:
@@ -129,6 +166,7 @@ async def search_sogou(query: str, max_results: int = 10) -> list[dict]:
     params = {"query": query}
     async with httpx.AsyncClient(headers=HEADERS, timeout=20, follow_redirects=True, trust_env=False) as c:
         r = await c.get(url, params=params)
+        r.raise_for_status()
     soup = _soup(r.text)
     out: list[dict] = []
     for div in soup.select("div.vrwrap, div.rb, div[class*='vrwrap']"):
@@ -142,7 +180,7 @@ async def search_sogou(query: str, max_results: int = 10) -> list[dict]:
         out.append(_result(title, href, snippet))
         if len(out) >= max_results:
             break
-    return out
+    return out or heuristic_fallback_extract(r.text, query, "https://www.sogou.com/", max_results)
 
 
 ENGINES = {
@@ -162,9 +200,22 @@ FALLBACK_CHAIN = {
 }
 
 
+async def _engine_results(engine: str, query: str, cap: int) -> list[dict]:
+    """Fetch one engine, with a short-lived cache to reduce repeated traffic."""
+    cache_key = {"engine": engine, "query": query, "cap": cap}
+    ttl = float(CONFIG.get("search_cache_ttl_sec", 0) or 0)
+    cached = _cache.get("search", ttl_sec=ttl, **cache_key) if ttl > 0 else None
+    if cached is not None:
+        return list(cached)
+    results = await ENGINES[engine](query, max_results=cap)
+    if ttl > 0:
+        _cache.put("search", results, **cache_key)
+    return results
+
+
 async def _engine_once(engine: str, query: str, cap: int):
     """调一个引擎并做相关性重排/过滤。返回 (kept, dropped, raw_count)。"""
-    results = await ENGINES[engine](query, max_results=cap)
+    results = await _engine_results(engine, query, cap)
     raw_count = len(results)
     if CONFIG.get("relevance_filter", True):
         kept, dropped = rerank(
@@ -199,19 +250,29 @@ async def search(query: str, engine: str = "baidu", max_results: int = 10) -> di
     keep_min = int(CONFIG.get("relevance_keep_min", 2))
     best = None          # (kept, dropped, used_engine)
     errors: dict = {}
+    skipped: dict = {}
     for eng in chain:
+        if CONFIG.get("engine_breaker_enabled", True) and not await BREAKER.allow(eng):
+            health = await BREAKER.status(eng)
+            skipped[eng] = f"cooldown ({health['cooldown_remaining_sec']}s remaining)"
+            continue
         try:
             kept, dropped, raw_count = await _engine_once(eng, query, cap)
         except Exception as ex:  # 引擎失败:记录并继续回退
             errors[eng] = f"{type(ex).__name__}: {ex}"
+            if CONFIG.get("engine_breaker_enabled", True):
+                await BREAKER.record_failure(eng, ex)
             continue
+        if CONFIG.get("engine_breaker_enabled", True):
+            await BREAKER.record_success(eng)
         if best is None or len(kept) > len(best[0]):
             best = (kept, dropped, eng)
         if len(kept) >= keep_min:   # 已拿到足够相关结果,停止回退
             break
 
     if best is None:
-        raise RuntimeError(f"所有搜索引擎均失败: {errors}")
+        diagnostics = {**errors, **skipped}
+        raise RuntimeError(f"所有搜索引擎均不可用: {diagnostics}")
 
     kept, dropped, used = best
     out = {
@@ -226,6 +287,8 @@ async def search(query: str, engine: str = "baidu", max_results: int = 10) -> di
         out["filtered_out"] = dropped
     if errors:
         out["engine_errors"] = errors
+    if skipped:
+        out["engine_skipped"] = skipped
     return out
 
 
@@ -319,10 +382,18 @@ async def search_multi(query: str, engines: Optional[list[str]] = None, max_resu
     cap = max(1, min(max_results, 20))
 
     async def _one(e: str):
+        if CONFIG.get("engine_breaker_enabled", True) and not await BREAKER.allow(e):
+            health = await BREAKER.status(e)
+            return e, None, f"cooldown ({health['cooldown_remaining_sec']}s remaining)"
         try:
-            return e, await ENGINES[e](query, max_results=cap), None
+            results = await _engine_results(e, query, cap)
         except Exception as ex:  # 单引擎失败不拖垮整体
+            if CONFIG.get("engine_breaker_enabled", True):
+                await BREAKER.record_failure(e, ex)
             return e, None, f"{type(ex).__name__}: {ex}"
+        if CONFIG.get("engine_breaker_enabled", True):
+            await BREAKER.record_success(e)
+        return e, results, None
 
     agg: dict[str, dict] = {}
     order: list[str] = []
