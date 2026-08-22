@@ -39,7 +39,7 @@
 | 搜索相关度(第二轮) | `relevance_filter` / `relevance_min_score` / `engine_fallback` 等 | 结果按相关度重排过滤 + 引擎自动回退 |
 | 搜索相关度(第三轮) | `relevance_phrase_gate` / `relevance_domain_bonus` | 引号短语门控 + 域名权威加成 |
 | 抓取默认 | `scrape_max_chars`(15000) / `scrape_describe_images` 等 | 正文上限(第四轮 30000→15000)、是否描述图片 |
-| 提取默认 | `extract_max_chars`(15000) / `extract_chunk_chars` | 三阶段提取参数(第四轮 30000→15000) |
+| 提取默认 | `extract_max_chars`(15000) / `extract_chunk_chars` / `search_extract_use_llm` | 三阶段提取参数；`False` 强制禁用，`True` 时由智能体自行决定是否在 `search_and_extract` 传 `use_llm_extract=true` |
 | 解析质量(第二轮) | `use_trafilatura` / `compact_markdown` | trafilatura 正文抽取、紧凑 markdown(省上下文) |
 | 性能优化(路线 A) | `cache_enabled` / `cache_ttl_hours` / `scrape_concurrency` / `vision_max_side` | 磁盘缓存、并行抓取限流、视觉图片降采样 |
 | Crawl4AI | `crawl4ai_base_dir` | 数据目录(留空=项目内) |

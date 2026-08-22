@@ -301,7 +301,9 @@ TOOLS = [
         "name": "search_and_extract",
         "description": (
             "搜索并自动抓取前 N 条结果,一步到位。"
-            "use_llm_extract=true 时走三阶段 LLM 提取(小模型逐块提取+大模型汇总),出综合总结。"
+            "当配置 search_extract_use_llm=true 时，智能体应按任务复杂度、是否需要跨页综合总结及耗时/模型成本自行决定 "
+            "use_llm_extract：true=三阶段 LLM 提取(小模型逐块提取+大模型汇总)并出综合总结，false=返回原始 markdown。"
+            "当该配置为 false 时，三阶段提取被强制禁用。"
         ),
         "inputSchema": {
             "type": "object",
@@ -316,8 +318,11 @@ TOOLS = [
                 "max_results": {"type": "number", "description": "抓取前几条结果", "default": 2},
                 "use_llm_extract": {
                     "type": "boolean",
-                    "description": "true=三阶段 LLM 提取并出综合总结;false=返回原始 markdown",
-                    "default": CONFIG["search_extract_use_llm"],
+                    "description": (
+                        "仅在配置 search_extract_use_llm=true 时可选：智能体应自行判断是否需要三阶段 LLM 提取和跨页综合总结；"
+                        "true=执行，false=返回原始 markdown。配置为 false 时传 true 也会被禁用。"
+                    ),
+                    "default": False,
                 },
                 "describe_images": {"type": "boolean", "default": False},
                 "max_images": {"type": "number", "default": 3},
@@ -868,6 +873,8 @@ async def call_tool(name: str, args: dict) -> dict:
                 image_prompt=args.get("image_prompt", ""),
             )
         if name == "search_and_extract":
+            # 配置是能力开关而非自动执行开关：开启后由智能体显式决定参数；关闭时一律禁用。
+            use_llm_extract = bool(CONFIG["search_extract_use_llm"]) and bool(args.get("use_llm_extract", False))
             return await _search_and_extract(
                 client,
                 args.get("query", ""),
@@ -875,7 +882,7 @@ async def call_tool(name: str, args: dict) -> dict:
                 int(args.get("max_results", 3)),
                 args.get("describe_images", CONFIG["scrape_describe_images"]),
                 int(args.get("max_images", 3)),
-                args.get("use_llm_extract", CONFIG["search_extract_use_llm"]),
+                use_llm_extract,
                 int(args.get("extract_max_chars", CONFIG["extract_max_chars"])),
                 int(args.get("extract_chunk_chars", CONFIG["extract_chunk_chars"])),
             )
