@@ -35,8 +35,9 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
-# 百度触发安全验证时,页面里会出现这些标记
-_BAIDU_VERIFY_MARKERS = ("百度安全验证", "wappass.baidu.com", "verify.baidu.com", "安全验证")
+# 百度触发安全验证时,页面标题或验证域名会出现这些标记。
+_BAIDU_VERIFY_TITLE_MARKERS = ("百度安全验证", "安全验证")
+_BAIDU_VERIFY_DOMAINS = ("wappass.baidu.com", "verify.baidu.com")
 
 
 def _text(el) -> str:
@@ -88,10 +89,14 @@ async def search_baidu(query: str, max_results: int = 10) -> list[dict]:
         r = await c.get(url, params=params)
         r.raise_for_status()
     html = r.text
-    if any(m in html for m in _BAIDU_VERIFY_MARKERS):
+    soup = _soup(html)
+    title_text = _text(soup.find("title"))
+    if (
+        any(marker in title_text for marker in _BAIDU_VERIFY_TITLE_MARKERS)
+        or any(domain in html for domain in _BAIDU_VERIFY_DOMAINS)
+    ):
         raise RuntimeError("百度触发了安全验证(反爬),请稍后重试,或改用 engine='bing' / '360'")
 
-    soup = _soup(html)
     out: list[dict] = []
     # 百度结果容器和标题/摘要的 class 经常变,这里做多套兜底
     for div in soup.select("div.result, div.c-container, div[class*='c-container']"):
@@ -200,22 +205,26 @@ FALLBACK_CHAIN = {
 }
 
 
-async def _engine_results(engine: str, query: str, cap: int) -> list[dict]:
-    """Fetch one engine, with a short-lived cache to reduce repeated traffic."""
+async def _engine_results(engine: str, query: str, cap: int) -> tuple[list[dict], bool]:
+    """Fetch one engine and return ``(results, from_cache)``.
+
+    The source flag lets callers distinguish an actual successful request from a cache
+    hit, which must not reset a circuit breaker cooldown.
+    """
     cache_key = {"engine": engine, "query": query, "cap": cap}
     ttl = float(CONFIG.get("search_cache_ttl_sec", 0) or 0)
     cached = _cache.get("search", ttl_sec=ttl, **cache_key) if ttl > 0 else None
     if cached is not None:
-        return list(cached)
+        return list(cached), True
     results = await ENGINES[engine](query, max_results=cap)
     if ttl > 0:
         _cache.put("search", results, **cache_key)
-    return results
+    return results, False
 
 
 async def _engine_once(engine: str, query: str, cap: int):
-    """调一个引擎并做相关性重排/过滤。返回 (kept, dropped, raw_count)。"""
-    results = await _engine_results(engine, query, cap)
+    """调一个引擎并做相关性重排/过滤。返回 (kept, dropped, raw_count, from_cache)。"""
+    results, from_cache = await _engine_results(engine, query, cap)
     raw_count = len(results)
     if CONFIG.get("relevance_filter", True):
         kept, dropped = rerank(
@@ -227,7 +236,7 @@ async def _engine_once(engine: str, query: str, cap: int):
         )
     else:
         kept, dropped = results, 0
-    return kept, dropped, raw_count
+    return kept, dropped, raw_count, from_cache
 
 
 async def search(query: str, engine: str = "baidu", max_results: int = 10) -> dict:
@@ -257,13 +266,13 @@ async def search(query: str, engine: str = "baidu", max_results: int = 10) -> di
             skipped[eng] = f"cooldown ({health['cooldown_remaining_sec']}s remaining)"
             continue
         try:
-            kept, dropped, raw_count = await _engine_once(eng, query, cap)
+            kept, dropped, raw_count, from_cache = await _engine_once(eng, query, cap)
         except Exception as ex:  # 引擎失败:记录并继续回退
             errors[eng] = f"{type(ex).__name__}: {ex}"
             if CONFIG.get("engine_breaker_enabled", True):
                 await BREAKER.record_failure(eng, ex)
             continue
-        if CONFIG.get("engine_breaker_enabled", True):
+        if not from_cache and CONFIG.get("engine_breaker_enabled", True):
             await BREAKER.record_success(eng)
         if best is None or len(kept) > len(best[0]):
             best = (kept, dropped, eng)
@@ -386,12 +395,12 @@ async def search_multi(query: str, engines: Optional[list[str]] = None, max_resu
             health = await BREAKER.status(e)
             return e, None, f"cooldown ({health['cooldown_remaining_sec']}s remaining)"
         try:
-            results = await _engine_results(e, query, cap)
+            results, from_cache = await _engine_results(e, query, cap)
         except Exception as ex:  # 单引擎失败不拖垮整体
             if CONFIG.get("engine_breaker_enabled", True):
                 await BREAKER.record_failure(e, ex)
             return e, None, f"{type(ex).__name__}: {ex}"
-        if CONFIG.get("engine_breaker_enabled", True):
+        if not from_cache and CONFIG.get("engine_breaker_enabled", True):
             await BREAKER.record_success(e)
         return e, results, None
 
