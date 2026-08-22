@@ -68,6 +68,18 @@ CONFIG = {
     "relevance_phrase_gate": float(_env("RELEVANCE_PHRASE_GATE", "0.35")),
     # 第三轮:域名与查询特征词互含(疑似官网)→ 得分加成,封顶 1.0
     "relevance_domain_bonus": float(_env("RELEVANCE_DOMAIN_BONUS", "0.2")),
+    # 质量低于阈值时继续回退；它只影响当前查询，不会污染网络故障熔断器。
+    "relevance_quality_min_avg": float(_env("RELEVANCE_QUALITY_MIN_AVG", "0.15")),
+    # 弱结果时有界地加深一次召回，避免复杂长尾查询被过小的默认 cap 限制。
+    "adaptive_retrieval_enabled": _env("ADAPTIVE_RETRIEVAL_ENABLED", "true").lower() in ("1", "true", "yes", "on"),
+    "adaptive_retrieval_max_results": int(_env("ADAPTIVE_RETRIEVAL_MAX_RESULTS", "10")),
+    "adaptive_retrieval_quality_trigger": float(_env("ADAPTIVE_RETRIEVAL_QUALITY_TRIGGER", "0.2")),
+    # 仅补偿极短摘要，且限定目标数和超时，防止 SERP 解析退化时放大抓取压力。
+    "snippet_compensation_min_chars": int(_env("SNIPPET_COMPENSATION_MIN_CHARS", "20")),
+    "snippet_compensation_max_results": int(_env("SNIPPET_COMPENSATION_MAX_RESULTS", "3")),
+    "snippet_compensation_timeout_sec": float(_env("SNIPPET_COMPENSATION_TIMEOUT_SEC", "8")),
+    # Bing CJK 单字词劫持的孤证软惩罚；权威域名自动豁免。
+    "bing_single_source_penalty": float(_env("BING_SINGLE_SOURCE_PENALTY", "0.4")),
     # 引擎自动回退:引擎报错或过滤后结果太少时,按 FALLBACK_CHAIN 换引擎重试
     "engine_fallback": _env("ENGINE_FALLBACK", "true").lower() in ("1", "true", "yes", "on"),
     # 引擎健康保护:连续失败后本进程内暂时冷却该引擎,减少无效重试和对站点的压力。

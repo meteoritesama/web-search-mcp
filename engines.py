@@ -56,6 +56,55 @@ def _soup(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "html.parser")
 
 
+async def _compensate_snippet(results: list[dict], query: str) -> list[dict]:
+    """Repair missing SERP snippets with bounded keyword-in-context page text.
+
+    This is best-effort only.  It is deliberately bounded and concurrent so a changed
+    360 layout does not turn one search into an unbounded sequential crawl.
+    """
+    phrases, terms = parse_query(query)
+    keywords = [k for k in terms + phrases if len(k) >= 2]
+    if not keywords:
+        return results
+
+    threshold = int(CONFIG.get("snippet_compensation_min_chars", 20))
+    limit = max(0, int(CONFIG.get("snippet_compensation_max_results", 3)))
+    targets = [r for r in results if len((r.get("snippet") or "").strip()) < threshold and r.get("url")][:limit]
+    if not targets:
+        return results
+
+    async def repair(client: httpx.AsyncClient, result: dict) -> None:
+        try:
+            response = await client.get(result["url"])
+            response.raise_for_status()
+            text = _soup(response.text).get_text(" ", strip=True)[:2000]
+            lower = text.lower()
+            for keyword in keywords:
+                index = lower.find(keyword.lower())
+                if index >= 0:
+                    start, end = max(0, index - 100), min(len(text), index + len(keyword) + 100)
+                    result["snippet"] = f"...{text[start:end]}..."
+                    result["snippet_source"] = "fallback_crawl"
+                    return
+            if text:
+                result["snippet"] = f"{text[:150]}..."
+                result["snippet_source"] = "fallback_crawl_preview"
+        except Exception:
+            # A supplemental crawl must never invalidate an otherwise usable result.
+            return
+
+    timeout = float(CONFIG.get("snippet_compensation_timeout_sec", 8))
+    async with httpx.AsyncClient(headers=HEADERS, timeout=timeout, follow_redirects=True, trust_env=False) as client:
+        await asyncio.gather(*(repair(client, result) for result in targets))
+    return results
+
+
+def _quality_average(results: list[dict]) -> float:
+    """Return the mean relevance of up to the first three ranked candidates."""
+    sample = results[:3]
+    return sum(float(result.get("relevance", 0.0)) for result in sample) / len(sample) if sample else 0.0
+
+
 def heuristic_fallback_extract(html: str, query: str, base_url: str, max_results: int) -> list[dict]:
     """Conservative structural fallback for layout drift, not a bypass mechanism.
 
@@ -267,6 +316,19 @@ async def search(query: str, engine: str = "baidu", max_results: int = 10) -> di
             continue
         try:
             kept, dropped, raw_count, from_cache = await _engine_once(eng, query, cap)
+            # SERP parsers sometimes yield titles/URLs but lose their descriptions.
+            # Repair before judging quality so recovered evidence participates in score.
+            if kept and not from_cache:
+                kept = await _compensate_snippet(kept, query)
+                if CONFIG.get("relevance_filter", True):
+                    kept, extra_dropped = rerank(
+                        query, kept,
+                        min_score=float(CONFIG.get("relevance_min_score", 0.05)),
+                        relative=float(CONFIG.get("relevance_relative", 0.35)),
+                        phrase_gate=float(CONFIG.get("relevance_phrase_gate", 0.35)),
+                        domain_bonus=float(CONFIG.get("relevance_domain_bonus", 0.2)),
+                    )
+                    dropped += extra_dropped
         except Exception as ex:  # 引擎失败:记录并继续回退
             errors[eng] = f"{type(ex).__name__}: {ex}"
             if CONFIG.get("engine_breaker_enabled", True):
@@ -274,9 +336,17 @@ async def search(query: str, engine: str = "baidu", max_results: int = 10) -> di
             continue
         if not from_cache and CONFIG.get("engine_breaker_enabled", True):
             await BREAKER.record_success(eng)
-        if best is None or len(kept) > len(best[0]):
+
+        quality = _quality_average(kept)
+        min_quality = float(CONFIG.get("relevance_quality_min_avg", 0.15))
+        quality_failed = len(kept) >= keep_min and quality < min_quality
+        if quality_failed:
+            # This is query-scoped fallback evidence, not an engine health failure:
+            # a rare query must not open the transport circuit for a healthy engine.
+            errors[f"{eng}_quality_fail"] = f"top-3 avg relevance too low: {quality:.3f}"
+        if best is None or (len(kept), quality) > (len(best[0]), _quality_average(best[0])):
             best = (kept, dropped, eng)
-        if len(kept) >= keep_min:   # 已拿到足够相关结果,停止回退
+        if len(kept) >= keep_min and not quality_failed:
             break
 
     if best is None:
@@ -284,6 +354,22 @@ async def search(query: str, engine: str = "baidu", max_results: int = 10) -> di
         raise RuntimeError(f"所有搜索引擎均不可用: {diagnostics}")
 
     kept, dropped, used = best
+    # Bounded adaptive retrieval: expand only once when the current engine supplied
+    # candidates but their aggregate evidence remains weak.  The larger cap is part
+    # of the cache key, so it cannot overwrite the shallow retrieval cache entry.
+    adaptive_max = min(30, max(cap, int(CONFIG.get("adaptive_retrieval_max_results", 10))))
+    adaptive_trigger = float(CONFIG.get("adaptive_retrieval_quality_trigger", 0.2))
+    if (
+        CONFIG.get("adaptive_retrieval_enabled", True)
+        and CONFIG.get("relevance_filter", True)
+        and kept
+        and _quality_average(kept) < adaptive_trigger
+        and cap < adaptive_max
+    ):
+        expanded = await search(query, engine=used, max_results=adaptive_max)
+        expanded["adaptive_retrieval"] = {"initial_cap": cap, "expanded_cap": adaptive_max, "reason": "low_relevance"}
+        return expanded
+
     out = {
         "query": query,
         "engine": used,
@@ -396,6 +482,10 @@ async def search_multi(query: str, engines: Optional[list[str]] = None, max_resu
             return e, None, f"cooldown ({health['cooldown_remaining_sec']}s remaining)"
         try:
             results, from_cache = await _engine_results(e, query, cap)
+            # Multi-search is where 360's absent SERP descriptions most hurt the
+            # synthesis model, so repair fresh SERPs before choosing the longest snippet.
+            if not from_cache:
+                results = await _compensate_snippet(results, query)
         except Exception as ex:  # 单引擎失败不拖垮整体
             if CONFIG.get("engine_breaker_enabled", True):
                 await BREAKER.record_failure(e, ex)
@@ -454,12 +544,21 @@ async def search_multi(query: str, engines: Optional[list[str]] = None, max_resu
     # 靠相关度把它们压到尾部即可,避免误删用户可能想要的实体。
     if CONFIG.get("relevance_filter", True):
         for m in merged:
-            m["relevance"] = round(
-                score_result(
-                    query, m["title"], m["snippet"], m.get("url", ""),
-                    phrase_gate=float(CONFIG.get("relevance_phrase_gate", 0.35)),
-                    domain_bonus=float(CONFIG.get("relevance_domain_bonus", 0.2)),
-                ), 3)
+            relevance = score_result(
+                query, m["title"], m["snippet"], m.get("url", ""),
+                phrase_gate=float(CONFIG.get("relevance_phrase_gate", 0.35)),
+                domain_bonus=float(CONFIG.get("relevance_domain_bonus", 0.2)),
+            )
+            # A Bing-only hit has historically been particularly prone to CJK
+            # single-character hijacking.  Keep authoritative domains exempt and use
+            # a soft penalty so fresh/niche legitimate sources remain discoverable.
+            if (
+                m["engine_count"] == 1
+                and m["engines"] == ["bing"]
+                and not any(domain in (m.get("url") or "").lower() for domain in (".gov.cn", ".edu.cn", ".org.cn"))
+            ):
+                relevance *= float(CONFIG.get("bing_single_source_penalty", 0.4))
+            m["relevance"] = round(relevance, 3)
         merged.sort(key=lambda x: (-x["engine_count"], -x["relevance"], x["_rank"]))
     else:
         merged.sort(key=lambda x: (-x["engine_count"], x["_rank"]))

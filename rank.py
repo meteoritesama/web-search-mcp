@@ -50,6 +50,22 @@ def parse_query(query: str) -> tuple[list[str], list[str]]:
     return phrases, terms
 
 
+def extract_core_entities(query: str) -> list[str]:
+    """Return meaningful query units for lightweight entity evidence.
+
+    This deliberately works on the query's explicit whitespace-delimited units rather
+    than attempting Chinese word segmentation.  A result only needs evidence for one
+    unit to pass the *soft* entity gate; ranking still rewards coverage of all units.
+    """
+    phrases, terms = parse_query(query)
+    entities: list[str] = []
+    for value in phrases + terms:
+        value = value.strip()
+        if len(value) >= 2 and value not in entities:
+            entities.append(value)
+    return entities
+
+
 def _host_of(url: str) -> str:
     try:
         host = url.split("//", 1)[1].split("/", 1)[0]
@@ -88,6 +104,7 @@ def score_result(
     url: str = "",
     phrase_gate: float = 0.35,
     domain_bonus: float = 0.2,
+    **kwargs,
 ) -> float:
     """对单条结果打分,返回 [0,1]。"""
     phrases, terms = parse_query(query)
@@ -124,7 +141,23 @@ def score_result(
     # 官方域名加成:域名与查询特征词互含
     if dom_match:
         score = min(1.0, score + domain_bonus)
-    return score
+
+    # Soft entity gate: avoid treating a single matching digit/year as relevance.
+    # It is intentionally a penalty, not a hard filter: aliases and terse SERP
+    # snippets are common, and a later KWIC repair can provide the missing evidence.
+    core_entities = extract_core_entities(query)
+    if core_entities:
+        corpus = f"{t} {s}"
+        if not any(entity in corpus for entity in core_entities):
+            score *= float(kwargs.get("entity_gate_penalty", 0.05))
+
+    # Optional freshness hook.  No date is inferred here: callers must supply a
+    # source-confirmed year, otherwise undated/evergreen material remains neutral.
+    query_year = kwargs.get("query_year")
+    real_year = kwargs.get("real_year")
+    if query_year and real_year and str(query_year) != str(real_year):
+        score *= float(kwargs.get("year_mismatch_penalty", 0.1))
+    return max(0.0, min(1.0, score))
 
 
 def rerank(
